@@ -1743,7 +1743,7 @@ ParallelCompress_compress_and_crc(ParallelCompress *self,
     Py_BLOCK_THREADS;
 
     if (err != Z_OK) {
-        zlib_error(self->zst, err, "error setting dictionary");
+        zlib_error(self->zst, err, "error compressing");
         goto error;
     }
     if (self->zst.avail_out == 0) {
