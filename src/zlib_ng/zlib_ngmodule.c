@@ -2225,8 +2225,6 @@ typedef struct _GzipReaderStruct {
     char stream_phase;
     char all_bytes_read;
     char closed;
-    uint32_t crc;
-    uint32_t stream_out;
     uint32_t _last_mtime;
     PyThread_type_lock lock;
     zng_stream zst;
@@ -2315,7 +2313,6 @@ GzipReader__new__(PyTypeObject *type, PyObject *args, PyObject *kwargs)
     self->stream_phase = GzipReader_HEADER;
     self->closed = 0;
     self->_last_mtime = 0;
-    self->crc = 0;
     self->lock = PyThread_allocate_lock();
     if (self->lock == NULL) {
         Py_DECREF(self);
@@ -2327,7 +2324,7 @@ GzipReader__new__(PyTypeObject *type, PyObject *args, PyObject *kwargs)
     self->zst.next_in = NULL;
     self->zst.avail_in = 0;
     self->zst.opaque = NULL;
-    int err = zng_inflateInit2(&(self->zst), -MAX_WBITS);
+    int err = zng_inflateInit2(&(self->zst), 16 + MAX_WBITS);
         switch (err) {
         case Z_OK:
         return (PyObject *)self;
@@ -2521,14 +2518,27 @@ GzipReader_read_into_buffer(GzipReader *self, uint8_t *out_buffer, size_t out_bu
                         }
                         header_cursor += 2;
                     }
-                    current_pos = header_cursor;
+
                     int reset_err = zng_inflateReset(&(self->zst));
                     if (reset_err != Z_OK) {
                         Py_BLOCK_THREADS;
                         zlib_error(self->zst, reset_err, "while initializing inflate stream.");
                         return -1;
                     }
-                    self->crc = 0;
+                    /* Using inflate with Z_BLOCK reads only the header */
+                    self->zst.next_in = current_pos;
+                    self->zst.avail_in = header_cursor - current_pos;
+                    static uint8_t tmp_buffer[8];
+                    self->zst.next_out = tmp_buffer;
+                    self->zst.avail_out = 8;
+                    int read_header_err = zng_inflate(&(self->zst), Z_BLOCK);
+                    if (read_header_err != Z_OK) {
+                        Py_BLOCK_THREADS;
+                        zlib_error(self->zst, read_header_err, "while reading header");
+                        return -1;
+                    }
+                    assert(self->zst.next_in == header_cursor);
+                    current_pos = header_cursor;
                     self->stream_phase = GzipReader_DEFLATE_BLOCK;
                 case GzipReader_DEFLATE_BLOCK:
                     self->zst.next_in = current_pos;
@@ -2547,13 +2557,29 @@ GzipReader_read_into_buffer(GzipReader *self, uint8_t *out_buffer, size_t out_bu
                             PyErr_SetString(PyExc_MemoryError,
                                             "Out of memory while decompressing data");
                             return -1;
+                        case Z_DATA_ERROR:
+                            uint32_t crc = load_u32_le(self->zst.next_in - 8);
+                            if (crc != self->zst.adler) {
+                                Py_BLOCK_THREADS;
+                                PyErr_Format(
+                                    BadGzipFile, 
+                                    "CRC check failed %u != %u", 
+                                    crc, self->zst.adler
+                                );
+                                return -1;
+                            }
+                            uint32_t length = load_u32_le(self->zst.next_in - 4);
+                            if (length != self->zst.total_out) {
+                                Py_BLOCK_THREADS;
+                                PyErr_SetString(BadGzipFile, "Incorrect length of data produced");
+                                return -1;
+                            }
                         default:
                             Py_BLOCK_THREADS;
                             zlib_error(self->zst, ret, "while decompressing data");
                             return -1;
                     }
                     size_t current_bytes_written = self->zst.next_out - out_buffer;
-                    self->crc = zng_crc32_z(self->crc, out_buffer, current_bytes_written);
                     bytes_written += current_bytes_written;
                     self->_pos += current_bytes_written;
                     out_buffer = self->zst.next_out;
@@ -2571,30 +2597,6 @@ GzipReader_read_into_buffer(GzipReader *self, uint8_t *out_buffer, size_t out_bu
                         self->current_pos = current_pos;
                         Py_BLOCK_THREADS;
                         return bytes_written;
-                    }
-                    // Block done check trailer.
-                    self->stream_phase = GzipReader_TRAILER;
-                case GzipReader_TRAILER:
-                    if (buffer_end - current_pos < 8) {
-                        break;
-                    }
-                    uint32_t crc = load_u32_le(current_pos);
-                    current_pos += 4;
-                    if (crc != self->crc) {
-                        Py_BLOCK_THREADS;
-                        PyErr_Format(
-                            BadGzipFile, 
-                            "CRC check failed %u != %u", 
-                            crc, self->crc
-                        );
-                        return -1;
-                    }
-                    uint32_t length = load_u32_le(current_pos);
-                    current_pos += 4; 
-                    if (length != self->zst.total_out) {
-                        Py_BLOCK_THREADS;
-                        PyErr_SetString(BadGzipFile, "Incorrect length of data produced");
-                        return -1;
                     }
                     self->stream_phase = GzipReader_NULL_BYTES;
                 case GzipReader_NULL_BYTES:
